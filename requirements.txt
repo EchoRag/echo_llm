@@ -5,3 +5,4 @@ clerk-backend-api
 python-dotenv==1.0.1
 pydantic
 ollama
+pyjwt[crypto]
