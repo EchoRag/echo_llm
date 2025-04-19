@@ -14,10 +14,146 @@ class VectorDatabase:
         
     async def initialize(self):
         """
-        Initialize the connection pool
+        Initialize the connection pool and create necessary tables
         """
         if not self.pool:
-            self.pool = await asyncpg.create_pool(self.connection_string)
+            self.pool = await asyncpg.create_pool(self.connection_string,max_size=5,min_size=2)
+            await self._create_tables()
+            
+    async def _create_tables(self):
+        """
+        Create necessary tables if they don't exist
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_provider_uid VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_provider_uid) REFERENCES users(provider_uid)
+                );
+
+                CREATE TABLE IF NOT EXISTS conversation_messages (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    conversation_id UUID REFERENCES conversations(id) ON DELETE CASCADE,
+                    role VARCHAR(10) NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    embedding vector(768),
+                    upvotes INTEGER DEFAULT 0,
+                    downvotes INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS message_votes (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    message_id UUID REFERENCES conversation_messages(id) ON DELETE CASCADE,
+                    user_provider_uid VARCHAR(255) NOT NULL,
+                    vote_type VARCHAR(10) NOT NULL CHECK (vote_type IN ('upvote', 'downvote')),
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(message_id, user_provider_uid)
+                );
+            ''')
+            
+    async def create_conversation(self, user_provider_uid: str) -> str:
+        """
+        Create a new conversation for a user and return its ID
+        
+        Args:
+            user_provider_uid: The provider_uid from the Node.js users table
+            
+        Returns:
+            The new conversation ID
+        """
+        async with self.pool.acquire() as conn:
+            conversation_id = await conn.fetchval('''
+                INSERT INTO conversations (user_provider_uid)
+                VALUES ($1)
+                RETURNING id
+            ''', user_provider_uid)
+            return str(conversation_id)
+            
+    async def add_message(self, conversation_id: str, role: str, content: str, embedding: List[float] = None) -> str:
+        """
+        Add a message to a conversation
+        
+        Returns:
+            The ID of the created message
+        """
+        async with self.pool.acquire() as conn:
+            # Convert embedding list to PostgreSQL vector format if present
+            embedding_vector = f"[{','.join(map(str, embedding))}]" if embedding else None
+            
+            message_id = await conn.fetchval('''
+                INSERT INTO conversation_messages (conversation_id, role, content, embedding)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id
+            ''', conversation_id, role, content, embedding_vector)
+            
+            return str(message_id)
+            
+    async def get_conversation_history(self, conversation_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Get recent messages from a conversation
+        """
+        async with self.pool.acquire() as conn:
+            messages = await conn.fetch('''
+                SELECT 
+                    id,
+                    role, 
+                    content,
+                    upvotes,
+                    downvotes
+                FROM conversation_messages
+                WHERE conversation_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+            ''', conversation_id, limit)
+            
+            return [
+                {
+                    "id": str(msg['id']),
+                    "role": msg['role'], 
+                    "content": msg['content'],
+                    "upvotes": msg['upvotes'],
+                    "downvotes": msg['downvotes']
+                }
+                for msg in reversed(messages)  # Reverse to get chronological order
+            ]
+            
+    async def get_user_conversations(self, user_provider_uid: str) -> List[Dict[str, Any]]:
+        """
+        Get all conversations for a user
+        
+        Args:
+            user_provider_uid: The provider_uid from the Node.js users table
+            
+        Returns:
+            List of conversations with their metadata
+        """
+        async with self.pool.acquire() as conn:
+            conversations = await conn.fetch('''
+                SELECT 
+                    c.id,
+                    c.created_at,
+                    c.updated_at,
+                    COUNT(cm.id) as message_count
+                FROM conversations c
+                LEFT JOIN conversation_messages cm ON c.id = cm.conversation_id
+                WHERE c.user_provider_uid = $1
+                GROUP BY c.id
+                ORDER BY c.updated_at DESC
+            ''', user_provider_uid)
+            
+            return [
+                {
+                    "id": str(conv['id']),
+                    "created_at": conv['created_at'],
+                    "updated_at": conv['updated_at'],
+                    "message_count": conv['message_count']
+                }
+                for conv in conversations
+            ]
             
     async def close(self):
         """
@@ -91,3 +227,97 @@ class VectorDatabase:
         except Exception as e:
             logger.error(f"Error searching similar documents: {str(e)}")
             raise 
+
+    async def vote_message(self, message_id: str, user_provider_uid: str, vote_type: str) -> Dict[str, int]:
+        """
+        Vote on a message
+        
+        Args:
+            message_id: The message ID to vote on
+            user_provider_uid: The user's provider UID
+            vote_type: Either 'upvote' or 'downvote'
+            
+        Returns:
+            Dictionary with updated vote counts
+        """
+        async with self.pool.acquire() as conn:
+            # First, check if user has already voted
+            existing_vote = await conn.fetchrow('''
+                SELECT vote_type FROM message_votes 
+                WHERE message_id = $1 AND user_provider_uid = $2
+            ''', message_id, user_provider_uid)
+
+            if existing_vote:
+                # If user is voting the same way again, remove the vote
+                if existing_vote['vote_type'] == vote_type:
+                    await conn.execute('''
+                        DELETE FROM message_votes 
+                        WHERE message_id = $1 AND user_provider_uid = $2
+                    ''', message_id, user_provider_uid)
+                    
+                    # Decrement the appropriate counter
+                    if vote_type == 'upvote':
+                        await conn.execute('''
+                            UPDATE conversation_messages 
+                            SET upvotes = upvotes - 1 
+                            WHERE id = $1
+                        ''', message_id)
+                    else:
+                        await conn.execute('''
+                            UPDATE conversation_messages 
+                            SET downvotes = downvotes - 1 
+                            WHERE id = $1
+                        ''', message_id)
+                else:
+                    # If user is changing their vote, update it
+                    await conn.execute('''
+                        UPDATE message_votes 
+                        SET vote_type = $1 
+                        WHERE message_id = $2 AND user_provider_uid = $3
+                    ''', vote_type, message_id, user_provider_uid)
+                    
+                    # Update both counters
+                    if vote_type == 'upvote':
+                        await conn.execute('''
+                            UPDATE conversation_messages 
+                            SET upvotes = upvotes + 1, downvotes = downvotes - 1 
+                            WHERE id = $1
+                        ''', message_id)
+                    else:
+                        await conn.execute('''
+                            UPDATE conversation_messages 
+                            SET upvotes = upvotes - 1, downvotes = downvotes + 1 
+                            WHERE id = $1
+                        ''', message_id)
+            else:
+                # New vote
+                await conn.execute('''
+                    INSERT INTO message_votes (message_id, user_provider_uid, vote_type)
+                    VALUES ($1, $2, $3)
+                ''', message_id, user_provider_uid, vote_type)
+                
+                # Increment the appropriate counter
+                if vote_type == 'upvote':
+                    await conn.execute('''
+                        UPDATE conversation_messages 
+                        SET upvotes = upvotes + 1 
+                        WHERE id = $1
+                    ''', message_id)
+                else:
+                    await conn.execute('''
+                        UPDATE conversation_messages 
+                        SET downvotes = downvotes + 1 
+                        WHERE id = $1
+                    ''', message_id)
+
+            # Get updated vote counts
+            result = await conn.fetchrow('''
+                SELECT upvotes, downvotes 
+                FROM conversation_messages 
+                WHERE id = $1
+            ''', message_id)
+            
+            return {
+                "upvotes": result['upvotes'],
+                "downvotes": result['downvotes']
+            } 

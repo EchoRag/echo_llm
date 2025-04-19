@@ -23,10 +23,19 @@ class RAG:
         """
         await self.db.close()
         
-    async def generate_response(self, prompt: str):
+    async def generate_response(self, prompt: str, conversation_id: str = None):
         try:
             # Create embeddings for the prompt
             prompt_embedding = await self._generate_embeddings(prompt)
+            
+            # Get conversation history if conversation_id is provided
+            conversation_context = ""
+            if conversation_id:
+                history = await self.db.get_conversation_history(conversation_id)
+                conversation_context = "\n".join([
+                    f"{msg['role']}: {msg['content']}"
+                    for msg in history
+                ])
             
             # Search for similar documents in the vector database
             similar_documents = await self.db.search_similar(prompt_embedding)
@@ -37,7 +46,13 @@ class RAG:
                 chunk_info = f"Chunk {doc['chunk_index']} from document {doc['document_id']}:\n{doc['chunk_text']}"
                 context_parts.append(chunk_info)
             
-            context = "\n\n".join(context_parts)
+            # Combine all context
+            context = "\n\n".join([
+                "Previous conversation:",
+                conversation_context,
+                "\nRelevant documents:",
+                "\n\n".join(context_parts)
+            ])
             
             # Generate response using the base model
             response = self.ollama_client.generate(
@@ -45,6 +60,21 @@ class RAG:
                 prompt=prompt,
                 system=context
             )
+            
+            # Store the conversation if conversation_id is provided
+            if conversation_id:
+                # Store user message
+                user_message_id = await self.db.add_message(conversation_id, "user", prompt, prompt_embedding)
+                
+                # Store assistant response
+                assistant_message_id = await self.db.add_message(conversation_id, "assistant", response.get("response", ""))
+                
+                return {
+                    "response": response.get("response", ""),
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": assistant_message_id
+                }
+            
             return response
         except Exception as e:
             logger.error(f"Error generating response: {str(e)}")
