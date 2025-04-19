@@ -60,11 +60,20 @@ class RAG:
                 prompt=prompt,
                 system=context
             )
-            response_embedding = await self._generate_embeddings(response.get("response", ""))
+            
             # Store the conversation if conversation_id is provided
             if conversation_id:
-                await self.db.add_message(conversation_id, "user", prompt, prompt_embedding)
-                await self.db.add_message(conversation_id, "assistant", response.get("response", ""), response_embedding)
+                # Store user message
+                user_message_id = await self.db.add_message(conversation_id, "user", prompt, prompt_embedding)
+                
+                # Store assistant response
+                assistant_message_id = await self.db.add_message(conversation_id, "assistant", response.get("response", ""))
+                
+                return {
+                    "response": response.get("response", ""),
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": assistant_message_id
+                }
             
             return response
         except Exception as e:

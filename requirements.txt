@@ -6,3 +6,7 @@ python-dotenv==1.0.1
 pydantic
 ollama
 pyjwt[crypto]
+opentelemetry-instrumentation-fastapi
+opentelemetry-api 
+opentelemetry-sdk 
+opentelemetry-exporter-otlp
