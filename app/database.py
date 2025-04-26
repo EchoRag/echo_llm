@@ -26,6 +26,11 @@ class VectorDatabase:
         """
         async with self.pool.acquire() as conn:
             await conn.execute('''
+                -- Enable required extensions
+                CREATE EXTENSION IF NOT EXISTS vector;
+                CREATE EXTENSION IF NOT EXISTS pg_trgm;
+                
+                -- Create tables
                 CREATE TABLE IF NOT EXISTS conversations (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     user_provider_uid VARCHAR(255) NOT NULL,
@@ -53,6 +58,35 @@ class VectorDatabase:
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(message_id, user_provider_uid)
                 );
+
+                -- Add tsvector column for full-text search
+                ALTER TABLE document_chunks 
+                ADD COLUMN IF NOT EXISTS tsv tsvector 
+                GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED;
+
+                -- Create indexes
+                CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding 
+                ON document_chunks USING ivfflat (embedding vector_cosine_ops) 
+                WITH (lists = 100);
+
+                CREATE INDEX IF NOT EXISTS idx_document_chunks_tsv 
+                ON document_chunks USING GIN (tsv);
+
+                -- Create function to update tsvector
+                CREATE OR REPLACE FUNCTION update_document_chunks_tsv()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.tsv := to_tsvector('english', NEW.chunk_text);
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                -- Create trigger for tsvector updates
+                DROP TRIGGER IF EXISTS update_document_chunks_tsv_trigger ON document_chunks;
+                CREATE TRIGGER update_document_chunks_tsv_trigger
+                    BEFORE INSERT OR UPDATE ON document_chunks
+                    FOR EACH ROW
+                    EXECUTE FUNCTION update_document_chunks_tsv();
             ''')
             
     async def create_conversation(self, user_provider_uid: str) -> str:
@@ -166,14 +200,18 @@ class VectorDatabase:
     async def search_similar(
         self,
         query_embedding: List[float],
-        n_results: int = 5
+        query_text: str = None,
+        n_results: int = 5,
+        similarity_threshold: float = 0.5
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar documents using cosine similarity.
+        Search for similar documents using hybrid search (vector + text).
         
         Args:
             query_embedding: Query embedding vector
+            query_text: Optional text query for full-text search
             n_results: Number of results to return
+            similarity_threshold: Minimum similarity score (0-1)
             
         Returns:
             List of similar documents with their metadata
@@ -187,8 +225,38 @@ class VectorDatabase:
             query_vector = f"[{','.join(map(str, query_embedding))}]"
             
             async with self.pool.acquire() as conn:
-                results = await conn.fetch('''
-                    SELECT 
+                # Set number of probes for ivfflat index
+                await conn.execute('SET ivfflat.probes = 10;')
+                
+                if query_text:
+                    # Hybrid search with both vector and text
+                    results = await conn.fetch('''
+                        WITH ranked_results AS (
+                            SELECT 
+                                dc.id as chunk_id,
+                                dc.chunk_text,
+                                dc.chunk_index,
+                                dc.metadata as chunk_metadata,
+                                dp.id as document_id,
+                                dp.content as full_content,
+                                dp.summary,
+                                dp.metadata as document_metadata,
+                                1 - (dc.embedding <=> $1::vector(768)) as vector_similarity,
+                                ts_rank_cd(dc.tsv, plainto_tsquery($2)) as text_rank
+                            FROM document_chunks dc
+                            JOIN documents_proc dp ON dc.document_id = dp.id
+                            WHERE dc.embedding IS NOT NULL
+                                AND dc.tsv @@ plainto_tsquery($2)
+                            ORDER BY vector_similarity DESC, text_rank DESC
+                            LIMIT $3
+                        )
+                        SELECT * FROM ranked_results
+                        WHERE vector_similarity >= $4
+                    ''', query_vector, query_text, n_results * 2, similarity_threshold)
+                else:
+                    # Vector-only search
+                    results = await conn.fetch('''
+                        SELECT 
                             dc.id as chunk_id,
                             dc.chunk_text,
                             dc.chunk_index,
@@ -197,16 +265,17 @@ class VectorDatabase:
                             dp.content as full_content,
                             dp.summary,
                             dp.metadata as document_metadata,
-                            1 - (dc.embedding <=> $1::vector(768)) as similarity
+                            1 - (dc.embedding <=> $1::vector(768)) as vector_similarity,
+                            0 as text_rank
                         FROM document_chunks dc
                         JOIN documents_proc dp ON dc.document_id = dp.id
                         WHERE dc.embedding IS NOT NULL
                         ORDER BY dc.embedding <=> $1::vector(768)
                         LIMIT $2
-                ''', query_vector, n_results)
+                    ''', query_vector, n_results)
                 
                 if not results:
-                    logger.warning("No similar documents found with similarity > 0.5")
+                    logger.warning("No similar documents found")
                     return []
                 
                 return [
@@ -219,7 +288,8 @@ class VectorDatabase:
                         "full_content": row['full_content'],
                         "summary": row['summary'],
                         "document_metadata": row['document_metadata'],
-                        "similarity": float(row['similarity'])
+                        "vector_similarity": float(row['vector_similarity']),
+                        "text_rank": float(row['text_rank'])
                     }
                     for row in results
                 ]
@@ -227,97 +297,3 @@ class VectorDatabase:
         except Exception as e:
             logger.error(f"Error searching similar documents: {str(e)}")
             raise 
-
-    async def vote_message(self, message_id: str, user_provider_uid: str, vote_type: str) -> Dict[str, int]:
-        """
-        Vote on a message
-        
-        Args:
-            message_id: The message ID to vote on
-            user_provider_uid: The user's provider UID
-            vote_type: Either 'upvote' or 'downvote'
-            
-        Returns:
-            Dictionary with updated vote counts
-        """
-        async with self.pool.acquire() as conn:
-            # First, check if user has already voted
-            existing_vote = await conn.fetchrow('''
-                SELECT vote_type FROM message_votes 
-                WHERE message_id = $1 AND user_provider_uid = $2
-            ''', message_id, user_provider_uid)
-
-            if existing_vote:
-                # If user is voting the same way again, remove the vote
-                if existing_vote['vote_type'] == vote_type:
-                    await conn.execute('''
-                        DELETE FROM message_votes 
-                        WHERE message_id = $1 AND user_provider_uid = $2
-                    ''', message_id, user_provider_uid)
-                    
-                    # Decrement the appropriate counter
-                    if vote_type == 'upvote':
-                        await conn.execute('''
-                            UPDATE conversation_messages 
-                            SET upvotes = upvotes - 1 
-                            WHERE id = $1
-                        ''', message_id)
-                    else:
-                        await conn.execute('''
-                            UPDATE conversation_messages 
-                            SET downvotes = downvotes - 1 
-                            WHERE id = $1
-                        ''', message_id)
-                else:
-                    # If user is changing their vote, update it
-                    await conn.execute('''
-                        UPDATE message_votes 
-                        SET vote_type = $1 
-                        WHERE message_id = $2 AND user_provider_uid = $3
-                    ''', vote_type, message_id, user_provider_uid)
-                    
-                    # Update both counters
-                    if vote_type == 'upvote':
-                        await conn.execute('''
-                            UPDATE conversation_messages 
-                            SET upvotes = upvotes + 1, downvotes = downvotes - 1 
-                            WHERE id = $1
-                        ''', message_id)
-                    else:
-                        await conn.execute('''
-                            UPDATE conversation_messages 
-                            SET upvotes = upvotes - 1, downvotes = downvotes + 1 
-                            WHERE id = $1
-                        ''', message_id)
-            else:
-                # New vote
-                await conn.execute('''
-                    INSERT INTO message_votes (message_id, user_provider_uid, vote_type)
-                    VALUES ($1, $2, $3)
-                ''', message_id, user_provider_uid, vote_type)
-                
-                # Increment the appropriate counter
-                if vote_type == 'upvote':
-                    await conn.execute('''
-                        UPDATE conversation_messages 
-                        SET upvotes = upvotes + 1 
-                        WHERE id = $1
-                    ''', message_id)
-                else:
-                    await conn.execute('''
-                        UPDATE conversation_messages 
-                        SET downvotes = downvotes + 1 
-                        WHERE id = $1
-                    ''', message_id)
-
-            # Get updated vote counts
-            result = await conn.fetchrow('''
-                SELECT upvotes, downvotes 
-                FROM conversation_messages 
-                WHERE id = $1
-            ''', message_id)
-            
-            return {
-                "upvotes": result['upvotes'],
-                "downvotes": result['downvotes']
-            } 

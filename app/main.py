@@ -34,14 +34,10 @@ resource = Resource(attributes={
     "service.version": "1.0.0"
 })
 
-trace.set_tracer_provider(TracerProvider(resource=resource))
-otlp_exporter = OTLPSpanExporter(
-    endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"),
-    insecure=True
-)
-trace.get_tracer_provider().add_span_processor(
-    BatchSpanProcessor(otlp_exporter)
-)
+# Get service token from environment
+SERVICE_TOKEN = os.getenv('SERVICE_TOKEN')
+if not SERVICE_TOKEN:
+    raise ValueError("SERVICE_TOKEN environment variable is required")
 
 # Initialize FastAPI app
 app = FastAPI(title="LLM API with Clerk Authentication")
@@ -125,9 +121,47 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
 db_connection_string = os.getenv("DATABASE_URL")
 rag = RAG(db_connection_string)
 
+async def register_with_proxy_server():
+    """
+    Register this LLM server with the proxy server
+    """
+    try:
+        # Get the server URL from environment or use default
+        server_url = 'http://localhost:8001'
+        # Get the public IP address
+        try:
+            response = requests.get('https://api.ipify.org?format=json')
+            if response.status_code == 200:
+                public_ip = response.json()['ip']
+                server_url = f"http://{public_ip}:8001"  # Using port 8001 as specified in server.py
+                logger.info(f"Using public IP address: {public_ip}")
+            else:
+                logger.warning("Failed to get public IP, using default server URL")
+        except Exception as e:
+            logger.error(f"Error getting public IP: {str(e)}")
+            logger.warning("Using default server URL")
+        # Make the registration request
+        response = requests.post(
+            f"{os.getenv('API_URL')}/api/v1/proxy-server/register",
+            json={'llmServerUrl': server_url},
+            headers={'Authorization': f'Bearer {SERVICE_TOKEN}'}
+        )
+        
+        if response.status_code == 200:
+            logger.info("Successfully registered with proxy server")
+            return response.json()
+        else:
+            logger.error(f"Failed to register with proxy server: {response.text}")
+            raise Exception(f"Proxy server registration failed: {response.text}")
+            
+    except Exception as e:
+        logger.error(f"Error registering with proxy server: {str(e)}")
+        raise
+
 @app.on_event("startup")
 async def startup_event():
     await rag.initialize()
+    await register_with_proxy_server()
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -150,14 +184,6 @@ class LLMResponse(BaseModel):
 
 class ConversationList(BaseModel):
     conversations: List[Dict[str, Any]]
-
-class VoteRequest(BaseModel):
-    # message_id: str
-    vote_type: str  # 'like' or 'dislike'
-
-class VoteResponse(BaseModel):
-    upvotes: int
-    downvotes: int
 
 @app.post("/generate", response_model=LLMResponse)
 async def generate_text(
@@ -197,29 +223,3 @@ async def health_check():
     with tracer.start_as_current_span("health_check"):
         return {"status": "healthy"}
 
-@app.post("/messages/{message_id}/vote", response_model=VoteResponse)
-async def vote_message(
-    message_id: str,
-    vote_request: VoteRequest,
-    auth: dict = Depends(verify_token)
-):
-    try:
-        if vote_request.vote_type not in ['like', 'dislike']:
-            raise HTTPException(status_code=400, detail="Invalid vote type. Must be 'like' or 'dislike'")
-            
-        # Convert like/dislike to upvote/downvote for database
-        db_vote_type = 'upvote' if vote_request.vote_type == 'like' else 'downvote'
-            
-        result = await rag.db.vote_message(
-            message_id=message_id,
-            user_provider_uid=auth["user_id"],
-            vote_type=db_vote_type
-        )
-        
-        return VoteResponse(**result)
-            
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing vote: {str(e)}"
-        ) 
