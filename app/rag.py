@@ -23,7 +23,7 @@ class RAG:
         """
         await self.db.close()
         
-    async def generate_response(self, prompt: str, conversation_id: str = None):
+    async def generate_response(self, prompt: str, user_provider_uid: str, conversation_id: str = None):
         try:
             # Create embeddings for the prompt
             prompt_embedding = await self._generate_embeddings(prompt)
@@ -38,7 +38,11 @@ class RAG:
                 ])
             
             # Search for similar documents in the vector database
-            similar_documents = await self.db.search_similar(prompt_embedding)
+            similar_documents = await self.db.search_similar(
+                query_embedding=prompt_embedding,
+                user_provider_uid=user_provider_uid,
+                query_text=prompt  # Use the prompt as text search query
+            )
             
             # Create context from chunk texts and their metadata
             context_parts = []

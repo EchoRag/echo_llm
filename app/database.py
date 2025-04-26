@@ -59,6 +59,10 @@ class VectorDatabase:
                     UNIQUE(message_id, user_provider_uid)
                 );
 
+                -- Add user_id to documents_proc if it doesn't exist
+                ALTER TABLE documents_proc 
+                ADD COLUMN IF NOT EXISTS user_provider_uid VARCHAR(255) NOT NULL DEFAULT 'system';
+
                 -- Add tsvector column for full-text search
                 ALTER TABLE document_chunks 
                 ADD COLUMN IF NOT EXISTS tsv tsvector 
@@ -71,6 +75,9 @@ class VectorDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_document_chunks_tsv 
                 ON document_chunks USING GIN (tsv);
+
+                CREATE INDEX IF NOT EXISTS idx_documents_proc_user 
+                ON documents_proc(user_provider_uid);
 
                 -- Create function to update tsvector
                 CREATE OR REPLACE FUNCTION update_document_chunks_tsv()
@@ -200,6 +207,7 @@ class VectorDatabase:
     async def search_similar(
         self,
         query_embedding: List[float],
+        user_provider_uid: str,
         query_text: str = None,
         n_results: int = 5,
         similarity_threshold: float = 0.5
@@ -209,6 +217,7 @@ class VectorDatabase:
         
         Args:
             query_embedding: Query embedding vector
+            user_provider_uid: The user's provider UID to filter documents
             query_text: Optional text query for full-text search
             n_results: Number of results to return
             similarity_threshold: Minimum similarity score (0-1)
@@ -247,12 +256,13 @@ class VectorDatabase:
                             JOIN documents_proc dp ON dc.document_id = dp.id
                             WHERE dc.embedding IS NOT NULL
                                 AND dc.tsv @@ plainto_tsquery($2)
+                                AND dp.user_provider_uid = $3
                             ORDER BY vector_similarity DESC, text_rank DESC
-                            LIMIT $3
+                            LIMIT $4
                         )
                         SELECT * FROM ranked_results
-                        WHERE vector_similarity >= $4
-                    ''', query_vector, query_text, n_results * 2, similarity_threshold)
+                        WHERE vector_similarity >= $5
+                    ''', query_vector, query_text, user_provider_uid, n_results * 2, similarity_threshold)
                 else:
                     # Vector-only search
                     results = await conn.fetch('''
@@ -270,9 +280,10 @@ class VectorDatabase:
                         FROM document_chunks dc
                         JOIN documents_proc dp ON dc.document_id = dp.id
                         WHERE dc.embedding IS NOT NULL
+                            AND dp.user_provider_uid = $2
                         ORDER BY dc.embedding <=> $1::vector(768)
-                        LIMIT $2
-                    ''', query_vector, n_results)
+                        LIMIT $3
+                    ''', query_vector, user_provider_uid, n_results)
                 
                 if not results:
                     logger.warning("No similar documents found")

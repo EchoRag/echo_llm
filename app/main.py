@@ -199,8 +199,9 @@ async def generate_text(
                 llm_request.conversation_id = await rag.db.create_conversation(user_provider_uid)
             
             response = await rag.generate_response(
-                llm_request.prompt,
-                llm_request.conversation_id
+                prompt=llm_request.prompt,
+                user_provider_uid=user_provider_uid,
+                conversation_id=llm_request.conversation_id
             )
             
             return LLMResponse(
